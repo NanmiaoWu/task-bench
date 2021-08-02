@@ -30,6 +30,55 @@ make -C core -j$THREADS
 make -C kernel_bench clean
 make -C kernel_bench all -j$THREADS
 
+############################### HPX ###############################
+if [[ $TASKBENCH_USE_BOOST -eq 1 ]]; then
+    pushd "$BOOST_SRC_DIR"
+    if [[ ! -d build ]]; then
+        mkdir build
+        cd build
+        ./bootstrap.sh --prefix=$BOOST_DIR
+        ./b2 install
+    fi
+    popd
+fi
+
+if [[ $TASKBENCH_USE_TCMALLOC -eq 1 ]]; then
+    pushd "$TCMALLOC_SRC_DIR"
+    if [[ ! -d build ]]; then
+        mkdir build
+        cd build
+        ./autogen.sh
+         ../configure --prefix=$TCMALLOC_DIR
+        make -j$THREADS
+        make install
+    fi
+    popd
+fi
+
+if [[ $TASKBENCH_USE_HPX -eq 1 ]]; then
+    export CC=mpicc
+    export CXX=mpicxx
+    cmake \
+        -DCMAKE_BUILD_TYPE=Release    \
+        -DHPX_WITH_MALLOC=tcmalloc    \
+        -DHPX_WITH_CXX17=ON           \
+        -DHPX_WITH_NETWORKING=ON      \
+        -DHPX_WITH_PARCELPORT_MPI=ON  \
+        -DHPX_WITH_PARCELPORT_TCP=OFF \
+        -DBOOST_ROOT=$BOOST_DIR       \ 
+        -DHWLOC_ROOT=$HWLOC_DIR       \
+        -DTCMALLOC_ROOT=$TCMALLOC_DIR \
+        -DHPX_WITH_MALLOC=tcmalloc    \
+        -DHPX_WITH_CXX17=ON           \
+        -DHPX_WITH_NETWORKING=ON      \
+        -DHPX_WITH_PARCELPORT_MPI=ON  \
+        -DHPX_WITH_PARCELPORT_TCP=OFF \
+        -Wdev                         \
+        $HPX_PATH
+    make -j$THREADS
+    make install
+fi
+###################################################################
 
 if [[ $TASKBENCH_USE_MPI -eq 1 ]]; then
     make -C mpi clean
