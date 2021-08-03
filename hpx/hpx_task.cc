@@ -174,9 +174,8 @@ int hpx_main(int argc, char *argv[])
             }
           }
         }
-        // fix me
-        MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
-        // end fix me
+
+        hpx::wait_all(futures);
 
         for (long point = std::max(first_point, offset); point <= std::min(last_point, offset + width - 1); ++point) {
           long point_index = point - first_point;
