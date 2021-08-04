@@ -5,14 +5,39 @@
 //  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
 
-#include "core.h"
+#include "../core/core.h"
 
+#include <tuple>
+
+#include <hpx/config.hpp>
+#if !defined(HPX_COMPUTE_DEVICE_CODE)
 #include "hpx/hpx.hpp"
+#include "hpx/hpx_init.hpp"
 #include "hpx/local/chrono.hpp"
+#include "hpx/modules/collectives.hpp"
+
+namespace detail{
+  std::tuple<long, long, long> tile(std::uint32_t loc_idx, long column, std::uint32_t numlocs)
+  {
+    long first_point;
+    long n_points = column / numlocs;
+    long rest = column % numlocs;
+    if (loc_idx < rest){
+      n_points ++;
+    }
+
+    if (rest != 0 && loc_idx >= rest){
+      first_point = (n_points + 1) * rest + n_points * (loc_idx - rest);
+    } else {
+      first_point = n_points * loc_idx;
+    }
+    long last_point = first_point + n_points - 1;
+    return std::make_tuple(first_point, last_point, n_points);
+  }
+} // namespace detail
 
 int hpx_main(int argc, char *argv[]) 
 { 
-
   // get number of localities and this locality
   std::uint32_t num_localities = hpx::get_num_localities(hpx::launch::sync);
   std::uint32_t this_locality = hpx::get_locality_id();
@@ -23,22 +48,39 @@ int hpx_main(int argc, char *argv[])
   std::vector<std::vector<char> > scratch;
 
   for (auto graph : app.graphs) {
-    long first_point = this_locality * graph.max_width / num_localities;
-    long last_point = (this_locality + 1) * graph.max_width / num_localities - 1;
-    long n_points = last_point - first_point + 1;
+    // hpx way
+    long first_point, last_point, n_points;
+    std::tie(first_point, last_point, n_points) = 
+        detail::tile(this_locality, graph.max_width, num_localities);
+
+    
+    //long first_point = this_locality * graph.max_width / num_localities;
+    //long last_point = (this_locality + 1) * graph.max_width / num_localities - 1;
+    //long n_points = last_point - first_point + 1;
 
     size_t scratch_bytes = graph.scratch_bytes_per_task;
     scratch.emplace_back(scratch_bytes * n_points);
     TaskGraph::prepare_scratch(scratch.back().data(), scratch.back().size());
   }
 
+  double elapsed = 0.0;
   for (int iter = 0; iter < 2; ++iter) {
     hpx::chrono::high_resolution_timer timer;
 
+    std::vector<hpx::future<std::vector<char>>> gets;
+    std::vector<hpx::future<void>> sets;
+                
+    std::vector<long> point_n_inputs_future_vec;
+    std::vector<long> point_inputs_future_vec;
+
     for (auto graph : app.graphs) {
-      long first_point = this_locality * graph.max_width / n_threads;
-      long last_point = (this_locality + 1) * graph.max_width / n_threads - 1;
-      long n_points = last_point - first_point + 1;
+      // hpx way
+      long first_point, last_point, n_points;
+      std::tie(first_point, last_point, n_points) =
+          detail::tile(this_locality, graph.max_width, num_localities);
+      //long first_point = this_locality * graph.max_width / num_localities;
+      //long last_point = (this_locality + 1) * graph.max_width / num_localities - 1;
+      //long n_points = last_point - first_point + 1;
 
       size_t scratch_bytes = graph.scratch_bytes_per_task;
       char *scratch_ptr = scratch[graph.graph_index].data();
@@ -116,6 +158,18 @@ int hpx_main(int argc, char *argv[])
         auto &deps = dependencies[dset];
         auto &rev_deps = reverse_dependencies[dset];
 
+        hpx::collectives::channel_communicator comm;
+        gets.clear();
+        sets.clear();
+                
+        point_n_inputs_future_vec.clear();
+        point_inputs_future_vec.clear();
+        //std::vector<hpx::future<std::vector<char>>> gets;
+        //std::vector<hpx::future<void>> sets;
+        //        
+        //std::vector<long> input_future_vec;
+        //std::vector<long> point_future_vec;
+
         for (long point = first_point; point <= last_point; ++point) {
           long point_index = point - first_point;
 
@@ -125,8 +179,6 @@ int hpx_main(int argc, char *argv[])
 
           auto &point_deps = deps[point_index];
           auto &point_rev_deps = rev_deps[point_index];
-
-          std::vector<hpx::lcos::future<std::vector<char>>> futures;
 
           /* Receive */
           point_n_inputs = 0;
@@ -142,14 +194,14 @@ int hpx_main(int argc, char *argv[])
                   auto &output = outputs[dep - first_point];
                   point_inputs[point_n_inputs].assign(output.begin(), output.end());
                 } else {
+                  //MPI_Irecv(point_inputs[point_n_inputs].data(),
+                  //          point_inputs[point_n_inputs].size(), MPI_BYTE,
+                  //          rank_by_point[dep], tag, MPI_COMM_WORLD, &req);
+                  std::size_t rec_loc_index = static_cast<std::size_t> (locality_by_point[dep]);
+                  gets.push_back(hpx::collectives::get<std::vector<char>>(comm, rec_loc_index));
 
-                  // fix me
-                  hpx::lcos::future<std::vector<char>> result = hpx::async();
-                  MPI_Irecv(point_inputs[point_n_inputs].data(),
-                            point_inputs[point_n_inputs].size(), MPI_BYTE,
-                            rank_by_point[dep], tag, MPI_COMM_WORLD, &req);
-                  futures.push_back(result);
-                  // end fix me
+                  point_n_inputs_future_vec.push_back(point_n_inputs);
+                  point_inputs_future_vec.push_back(point_index);
                 }
                 point_n_inputs++;
               }
@@ -163,19 +215,23 @@ int hpx_main(int argc, char *argv[])
                 if (dep < offset || dep >= offset + width || (first_point <= dep && dep <= last_point)) {
                   continue;
                 }
-
-                // fix me
-                hpx::lcos::future<std::vector<char>> result = hpx::async();
-                MPI_Isend(point_output.data(), point_output.size(), MPI_BYTE,
-                          rank_by_point[dep], tag, MPI_COMM_WORLD, &req);
-                futures.push_back(result);
-                // end fix me
+                //MPI_Isend(point_output.data(), point_output.size(), MPI_BYTE,
+                //          rank_by_point[dep], tag, MPI_COMM_WORLD, &req);
+                std::size_t send_loc_index = static_cast<std::size_t>(locality_by_point[dep]);
+                sets.push_back(hpx::collectives::set(comm, send_loc_index, point_output));
               }
             }
           }
         }
 
-        hpx::wait_all(futures);
+        hpx::wait_all(sets, gets);
+
+        for (std::size_t i = 0; i != gets.size(); ++i) {
+          auto point_n_inputs = point_n_inputs_future_vec[i];
+          auto point_idx = point_inputs_future_vec[i];
+          auto rec_point_inputs = inputs[point_idx];
+          rec_point_inputs[point_n_inputs]= gets[i].get();
+        }
 
         for (long point = std::max(first_point, offset); point <= std::min(last_point, offset + width - 1); ++point) {
           long point_index = point - first_point;
@@ -205,5 +261,9 @@ int hpx_main(int argc, char *argv[])
 
 int main(int argc, char *argv[]) 
 { 
-  return hpx::init(argc, argv);
+  std::vector<std::string> const cfg = {"hpx.run_hpx_main!=1"};
+  hpx::init_params init_args;
+  init_args.cfg = cfg;
+  return hpx::init(argc, argv, init_args);
 }
+#endif
